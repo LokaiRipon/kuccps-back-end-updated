@@ -71,6 +71,12 @@ def create_app() -> FastAPI:
     # Include routers
     app.include_router(api_router, prefix="/api")
 
+    # for uptime robot to keep the server awake
+    @app.head("/")
+    async def root_head():
+        """Health check endpoint"""
+        return {"status": "OK"}
+    
     # Health check endpoint
     @app.get("/health")
     async def health_check():
