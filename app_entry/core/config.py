@@ -16,11 +16,11 @@ class Settings(BaseSettings):
         'MONGO_URI',
         'mongodb://localhost:27017'
     )
-    DATABASE_NAME: str = 'courses_2'
+    DEGREE_DB: str = 'courses_2'
     DP_COURSES_DB: str = 'dp_courses'
     CERT_COURSES_DB: str = 'cert_courses'
     KMTC_COURSES_DB: str = 'kmtc'
-    PAYMENTS_DB: str = 'payments-26\''
+    PAYMENTS_DB: str = 'payments_db'
     
     # API
     API_TITLE: str = 'KUCCPS Course Checker'
@@ -43,8 +43,9 @@ class Settings(BaseSettings):
     # Paystack
     PAYSTACK_SECRET_KEY: str = os.getenv('PAYSTACK_SECRET_KEY', '')
     PAYSTACK_API_URL: str = 'https://api.paystack.co'
+    PAYSTACK_PUBLIC_KEY: str = os.getenv('PAYSTACK_PUBLIC_KEY', '')
     
-    # Cache
+    # Cache - in hours
     CACHE_TTL_HOURS: int = 6
     
     # Logging

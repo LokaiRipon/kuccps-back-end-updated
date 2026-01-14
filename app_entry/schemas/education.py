@@ -42,6 +42,7 @@ class CourseCheckRequest(BaseModel):
 
 class Programme(BaseModel):
     """Course/Programme information"""
+    institution_name: str
     programme_name: str
     programme_code: Optional[Union[str, int]] = None  # CHANGED: Accept both string and int
     minimum_grade: Optional[str] = None

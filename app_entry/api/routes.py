@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter
 
-from app.api.endpoints import courses, payments
+from app_entry.api.endpoints import courses, payments
 
 router = APIRouter()
 

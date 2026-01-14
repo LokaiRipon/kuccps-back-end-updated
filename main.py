@@ -1,4 +1,4 @@
-from app import create_app
+from app_entry import create_app
 import uvicorn
 
 # creating the app instance

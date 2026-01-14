@@ -5,7 +5,7 @@
 """Input validation utilities"""
 
 from typing import List, Tuple
-from app.schemas.education import SubjectGrade
+from app_entry.schemas.education import SubjectGrade
 import logging
 
 logger = logging.getLogger(__name__)

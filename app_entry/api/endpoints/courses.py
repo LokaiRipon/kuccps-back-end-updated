@@ -1,5 +1,5 @@
 # ============================================================================
-# FILE: app/api/endpoints/courses.py (SAFER VERSION)
+# FILE: app_entry/api/endpoints/courses.py (UPDATED - multi-DB safe)
 # ============================================================================
 """Course checking endpoints - defensive version"""
 
@@ -9,14 +9,15 @@ from datetime import datetime
 import logging
 from typing import List
 
-from app.schemas.education import (
+from app_entry.schemas.education import (
     CourseCheckRequest, CourseCheckResponse, EducationType,
     ClusterResult, Programme
 )
-from app.core.cache import CourseCache
-from app.core.dependencies import get_db, get_cache
-from app.utils.grade_checker import GradeChecker
-from app.utils.validators import validate_subjects
+from app_entry.core.cache import CourseCache
+from app_entry.core.dependencies import get_db_by_name, get_cache
+from app_entry.core.config import settings
+from app_entry.utils.grade_checker import GradeChecker
+from app_entry.utils.validators import validate_subjects
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -24,15 +25,24 @@ router = APIRouter()
 def _safe_programme(p: dict) -> dict:
     """Safely extract programme data, handling MongoDB ObjectIds and other issues"""
     try:
+        # Handle minimum_grade - it's a dict like {'mean_grade': 'D'}
+        min_grade = p.get("minimum_grade", {})
+        if isinstance(min_grade, dict):
+            grade_value = min_grade.get("mean_grade", "")
+        else:
+            grade_value = str(min_grade) if min_grade else None
+        
         return {
+            "institution_name": str(p.get("institution_name", "")),
             "programme_name": str(p.get("programme_name", "")),
             "programme_code": str(p.get("programme_code", "")) if p.get("programme_code") else None,
-            "minimum_grade": str(p.get("minimum_grade", "")) if p.get("minimum_grade") else None,
+            "minimum_grade": grade_value,
             "minimum_subject_requirements": p.get("minimum_subject_requirements", {}) if isinstance(p.get("minimum_subject_requirements"), dict) else {}
         }
     except Exception as e:
         logger.error(f"Error converting programme: {e}")
         return {
+            "institution_name": "",
             "programme_name": "",
             "programme_code": None,
             "minimum_grade": None,
@@ -154,7 +164,7 @@ async def _check_kmtc(checker: GradeChecker, min_grade: str, cache: CourseCache)
 @router.post("/check", response_model=CourseCheckResponse)
 async def check_courses(
     request: CourseCheckRequest,
-    db: AsyncIOMotorDatabase = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db_by_name(settings.PAYMENTS_DB)),
     cache: CourseCache = Depends(get_cache)
 ) -> CourseCheckResponse:
     """Check which courses user qualifies for"""
@@ -209,7 +219,7 @@ async def check_courses(
         logger.info(f"Found {len(results)} clusters with qualified programmes")
         
         # Save user info for later (for checkout)
-        await db["payments"].update_one(
+        await db["payments_info"].update_one(
             {"$or": [{"email": request.email}, {"ksce_index": request.index_number}]},
             {
                 "$set": {
