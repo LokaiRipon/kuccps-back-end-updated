@@ -1,7 +1,7 @@
 # ============================================================================
-# FILE: app_entry/api/endpoints/courses.py (UPDATED - multi-DB safe)
+# FILE: app_entry/api/endpoints/courses.py (FIXED - with cluster_weights)
 # ============================================================================
-"""Course checking endpoints - defensive version"""
+"""Course checking endpoints - with multi-step qualification"""
 
 from fastapi import APIRouter, HTTPException, status, Depends
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -36,6 +36,7 @@ def _safe_programme(p: dict) -> dict:
             "institution_name": str(p.get("institution_name", "")),
             "programme_name": str(p.get("programme_name", "")),
             "programme_code": str(p.get("programme_code", "")) if p.get("programme_code") else None,
+            "cut_off_points": float(p.get("cut_off_points", 0.0)) if p.get("cut_off_points") else None,
             "minimum_grade": grade_value,
             "minimum_subject_requirements": p.get("minimum_subject_requirements", {}) if isinstance(p.get("minimum_subject_requirements"), dict) else {}
         }
@@ -45,6 +46,7 @@ def _safe_programme(p: dict) -> dict:
             "institution_name": "",
             "programme_name": "",
             "programme_code": None,
+            "cut_off_points": None,
             "minimum_grade": None,
             "minimum_subject_requirements": {}
         }
@@ -54,7 +56,7 @@ def _safe_programme(p: dict) -> dict:
 # ============================================================================
 
 async def _check_degree(checker: GradeChecker, min_grade: str, cache: CourseCache) -> List[ClusterResult]:
-    """Check degree programmes"""
+    """Check degree programmes with cut-off points validation"""
     results = []
     for cluster_no in range(1, 21):
         try:
@@ -62,7 +64,8 @@ async def _check_degree(checker: GradeChecker, min_grade: str, cache: CourseCach
             qualified = []
             for p in programmes:
                 try:
-                    if checker.check_programme_requirements(p, min_grade):
+                    # Pass cluster number for cut-off points check
+                    if checker.check_programme_requirements(p, min_grade, cluster_number=str(cluster_no)):
                         safe_p = _safe_programme(p)
                         qualified.append(Programme(**safe_p))
                 except Exception as e:
@@ -74,6 +77,7 @@ async def _check_degree(checker: GradeChecker, min_grade: str, cache: CourseCach
                     cluster_name=f"cluster_{cluster_no}",
                     programmes=qualified
                 ))
+                logger.info(f"✓ Cluster {cluster_no}: {len(qualified)} qualified programmes")
         except Exception as e:
             logger.error(f"Error checking cluster {cluster_no}: {e}")
             continue
@@ -100,6 +104,7 @@ async def _check_diploma(checker: GradeChecker, min_grade: str, cache: CourseCac
                     cluster_name=category,
                     programmes=qualified
                 ))
+                logger.info(f"✓ Diploma {category}: {len(qualified)} qualified programmes")
         except Exception as e:
             logger.error(f"Error checking category {category}: {e}")
             continue
@@ -126,6 +131,7 @@ async def _check_certificate(checker: GradeChecker, min_grade: str, cache: Cours
                     cluster_name=category,
                     programmes=qualified
                 ))
+                logger.info(f"✓ Cert {category}: {len(qualified)} qualified programmes")
         except Exception as e:
             logger.error(f"Error checking category {category}: {e}")
             continue
@@ -152,6 +158,7 @@ async def _check_kmtc(checker: GradeChecker, min_grade: str, cache: CourseCache)
                     cluster_name=category,
                     programmes=qualified
                 ))
+                logger.info(f"✓ KMTC {category}: {len(qualified)} qualified programmes")
         except Exception as e:
             logger.error(f"Error checking category {category}: {e}")
             continue
@@ -167,7 +174,12 @@ async def check_courses(
     db: AsyncIOMotorDatabase = Depends(get_db_by_name(settings.PAYMENTS_DB)),
     cache: CourseCache = Depends(get_cache)
 ) -> CourseCheckResponse:
-    """Check which courses user qualifies for"""
+    """Check which courses user qualifies for
+    
+    Multi-step qualification logic:
+    - DEGREE: cut_off_points → minimum_grade → subject_requirements
+    - DIPLOMA/CERT/KMTC: minimum_grade → subject_requirements
+    """
     
     # Validate subjects
     is_valid, error_msg = validate_subjects(request.subjects)
@@ -179,7 +191,7 @@ async def check_courses(
         )
     
     try:
-        logger.info(f"Checking courses for {request.email} - Type: {request.education_type}")
+        logger.info(f"🔍 Checking courses for {request.email} - Type: {request.education_type}")
         
         # Extract grades from the subjects list
         grade_dict = {}
@@ -199,27 +211,37 @@ async def check_courses(
                 detail="Overall grade is required"
             )
         
-        logger.info(f"User grades: {grade_dict}")
-        logger.info(f"Minimum grade: {min_grade}")
+        logger.info(f"📊 User grades extracted: {len(grade_dict)} subjects, overall={min_grade}")
         
-        # Create grade checker with user's grades
-        checker = GradeChecker(grade_dict)
+        # Create grade checker with ALL necessary info
+        checker = GradeChecker(
+            user_grades=grade_dict,
+            education_type=EducationType(request.education_type),
+            cluster_weights=request.cluster_weights or {}
+        )
+        
         results = []
         
         # Check courses based on education type
         if request.education_type == EducationType.DEGREE:
+            logger.info("🎓 Running DEGREE qualification logic with cut-off points")
             results = await _check_degree(checker, min_grade, cache)
         elif request.education_type == EducationType.DIPLOMA:
+            logger.info("📚 Running DIPLOMA qualification logic")
             results = await _check_diploma(checker, min_grade, cache)
         elif request.education_type == EducationType.CERTIFICATE:
+            logger.info("🏆 Running CERTIFICATE qualification logic")
             results = await _check_certificate(checker, min_grade, cache)
         elif request.education_type == EducationType.KMTC:
+            logger.info("🏥 Running KMTC qualification logic")
             results = await _check_kmtc(checker, min_grade, cache)
         
-        logger.info(f"Found {len(results)} clusters with qualified programmes")
+        # Count total qualified programmes
+        total_qualified = sum(len(cluster.programmes) for cluster in results)
+        logger.info(f"✅ Found {len(results)} clusters with {total_qualified} qualified programmes")
         
         # Save user info for later (for checkout)
-        await db["payments_info"].update_one(
+        await db["payments"].update_one(
             {"$or": [{"email": request.email}, {"ksce_index": request.index_number}]},
             {
                 "$set": {
@@ -231,7 +253,7 @@ async def check_courses(
             upsert=True
         )
         
-        # Also save the course check results
+        # Save the course check results
         result_doc = {
             "email": request.email,
             "index_number": request.index_number,

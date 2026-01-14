@@ -1,15 +1,18 @@
 # ============================================================================
-# FILE: app/utils/grade_checker.py (FIXED - HANDLE DICT ERROR)
+# FILE: app_entry/utils/grade_checker.py (CLEANED - Production Ready)
 # ============================================================================
-"""Grade checking and programme matching logic"""
+"""Grade checking and programme matching logic with education type support"""
 
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import logging
 
 logger = logging.getLogger(__name__)
 
+# Import EducationType from schemas to avoid duplication
+from app_entry.schemas.education import EducationType
+
 class GradeChecker:
-    """Handles grade validation and programme matching"""
+    """Handles grade validation and programme matching with multi-step qualification"""
     
     GRADE_POINTS = {
         "A": 12, "A-": 11, "B+": 10, "B": 9, "B-": 8,
@@ -17,77 +20,119 @@ class GradeChecker:
         "D-": 2, "E": 1,
     }
     
-    def __init__(self, user_grades: Dict[str, str]):
-        """Initialize with user's grades
-        
-        Args:
-            user_grades: Dictionary mapping subject names to grades
-                        e.g., {"mathematics": "A", "english": "B+"}
-        """
+    def __init__(
+        self,
+        user_grades: Dict[str, str],
+        education_type: EducationType = EducationType.DEGREE,
+        cluster_weights: Optional[Dict[str, float]] = None
+    ):
+        """Initialize with user's grades and education type"""
         self.user_grades = user_grades
-        logger.debug(f"Initialized GradeChecker with {len(user_grades)} grades")
+        self.education_type = education_type
+        self.cluster_weights = cluster_weights or {}
+        logger.debug(f"GradeChecker initialized: type={education_type}, grades={len(user_grades)}, clusters={len(self.cluster_weights)}")
     
     def check_programme_requirements(
         self,
         programme: Dict[str, Any],
-        user_min_grade: str
+        user_min_grade: str,
+        cluster_number: Optional[str] = None
     ) -> bool:
-        """Check if user qualifies for a programme
+        """Check if user qualifies for a programme (multi-step validation)"""
+        prog_name = programme.get('programme_name', 'Unknown')
         
-        Args:
-            programme: Programme dict from database
-            user_min_grade: User's overall grade
-            
-        Returns:
-            True if user qualifies, False otherwise
-        """
         try:
-            # Check minimum grade requirement
-            prog_min_grade = programme.get("minimum_grade")
-            if prog_min_grade:
-                if self._grade_value(user_min_grade) < self._grade_value(prog_min_grade):
+            # STEP 1: Cut-off points check (DEGREES ONLY)
+            if self.education_type == EducationType.DEGREE:
+                if not self._check_cutoff_points(programme, cluster_number):
                     return False
             
-            # Check subject requirements
-            subject_reqs = programme.get("minimum_subject_requirements", {})
+            # STEP 2: Minimum grade check
+            if not self._check_minimum_grade(programme, user_min_grade):
+                return False
             
-            # Handle case where subject_reqs might be None or empty
-            if not subject_reqs or not isinstance(subject_reqs, dict):
+            # STEP 3: Subject requirements check
+            if not self._check_subjects(programme.get("minimum_subject_requirements", {})):
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error checking {prog_name}: {e}", exc_info=True)
+            return False
+    
+    def _check_cutoff_points(self, programme: Dict[str, Any], cluster_number: Optional[str]) -> bool:
+        """Check cut-off points qualification (degrees only)"""
+        if self.education_type != EducationType.DEGREE or not cluster_number:
+            return True
+        
+        try:
+            prog_cutoff = programme.get("cut_off_points")
+            
+            # If no cutoff requirement, user qualifies
+            if prog_cutoff is None or prog_cutoff == "":
                 return True
             
-            return self._check_subjects(subject_reqs)
+            # Get the cluster key (e.g., "cl1" from "1")
+            cluster_key = f"cl{cluster_number}"
+            user_weight = self.cluster_weights.get(cluster_key, 0.0)
+            
+            # Convert to float for comparison
+            try:
+                prog_cutoff = float(prog_cutoff)
+            except (TypeError, ValueError):
+                logger.warning(f"Invalid cut_off_points: {prog_cutoff}")
+                return True
+            
+            return user_weight >= prog_cutoff
+            
         except Exception as e:
-            logger.error(f"Error checking programme requirements: {e}")
-            # If there's an error, assume user doesn't qualify to be safe
+            logger.error(f"Error checking cut-off points: {e}")
+            return False
+    
+    def _check_minimum_grade(self, programme: Dict[str, Any], user_grade: str) -> bool:
+        """Check minimum grade requirement"""
+        try:
+            prog_min_grade = programme.get("minimum_grade")
+            
+            if prog_min_grade is None or prog_min_grade == "":
+                return True
+            
+            # Extract the actual grade value
+            if isinstance(prog_min_grade, dict):
+                grade_value = prog_min_grade.get("mean_grade")
+                if not grade_value:
+                    return True
+            else:
+                grade_value = prog_min_grade
+            
+            # Compare grades
+            user_grade_val = self._grade_value(user_grade)
+            prog_grade_val = self._grade_value(str(grade_value))
+            
+            return user_grade_val >= prog_grade_val
+            
+        except Exception as e:
+            logger.error(f"Error checking minimum grade: {e}")
             return False
     
     def _check_subjects(self, requirements: Dict[str, str]) -> bool:
-        """Verify user has all required subjects with required grades
-        
-        Args:
-            requirements: Dict of subject -> grade requirements
-            
-        Returns:
-            True if all requirements met, False otherwise
-        """
+        """Verify user has all required subjects with required grades"""
         try:
-            # Make sure requirements is actually a dict
-            if not isinstance(requirements, dict):
-                logger.warning(f"requirements is not a dict: {type(requirements)}")
+            if not requirements or not isinstance(requirements, dict):
                 return True
             
             for req_subject, req_grade in requirements.items():
-                # Skip if req_subject or req_grade is None or not a string
                 if not req_subject or not isinstance(req_subject, str):
                     continue
                 if not req_grade or not isinstance(req_grade, str):
                     continue
                 
-                # Handle subject alternatives (e.g., "Math/Statistics")
+                # Handle subject alternatives (e.g., "ENG/KIS" or "Math/Statistics")
                 if "/" in req_subject:
-                    subjects = req_subject.split("/")
+                    subjects = [s.strip() for s in req_subject.split("/")]
                     found = any(
-                        self._user_has_subject(s.strip(), req_grade)
+                        self._user_has_subject(s, req_grade)
                         for s in subjects
                     )
                     if not found:
@@ -95,54 +140,42 @@ class GradeChecker:
                 else:
                     if not self._user_has_subject(req_subject, req_grade):
                         return False
+            
             return True
+            
         except Exception as e:
             logger.error(f"Error checking subjects: {e}")
             return False
     
     def _user_has_subject(self, subject: str, required_grade: str) -> bool:
-        """Check if user has subject with required grade
-        
-        Args:
-            subject: Required subject name
-            required_grade: Minimum grade required
-            
-        Returns:
-            True if user qualifies, False otherwise
-        """
+        """Check if user has subject with required grade"""
         try:
-            # Ensure inputs are strings
             if not isinstance(subject, str) or not isinstance(required_grade, str):
                 return False
             
             subject_lower = subject.lower().strip()
+            required_grade_val = self._grade_value(required_grade)
             
             for user_subject, user_grade in self.user_grades.items():
-                # Ensure both are strings
                 if not isinstance(user_subject, str) or not isinstance(user_grade, str):
                     continue
                 
                 user_subject_lower = user_subject.lower().strip()
                 
-                if subject_lower in user_subject_lower:
-                    user_grade_value = self._grade_value(user_grade)
-                    required_grade_value = self._grade_value(required_grade)
-                    return user_grade_value >= required_grade_value
+                if subject_lower in user_subject_lower or user_subject_lower in subject_lower:
+                    user_grade_val = self._grade_value(user_grade)
+                    qualified = user_grade_val >= required_grade_val
+                    if qualified:
+                        return True
             
             return False
+            
         except Exception as e:
-            logger.error(f"Error checking if user has subject: {e}")
+            logger.error(f"Error checking user subject: {e}")
             return False
     
     def _grade_value(self, grade: str) -> int:
-        """Get numeric value of grade for comparison
-        
-        Args:
-            grade: Letter grade (e.g., "A", "B+")
-            
-        Returns:
-            Numeric value, or 0 if invalid
-        """
+        """Get numeric value of grade for comparison"""
         if not isinstance(grade, str):
             return 0
         
