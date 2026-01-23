@@ -1,9 +1,9 @@
 # ============================================================================
-# FILE: api/endpoints/clusterWeight.py (NEW)
+# FILE: api/endpoints/clusterWeight.py
 # ============================================================================
 """Cluster Weight Calculator payment endpoints"""
 
-from fastapi import APIRouter, HTTPException, status, Depends
+from fastapi import APIRouter, HTTPException, status, Query, Depends
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from datetime import datetime
 import logging
@@ -37,6 +37,16 @@ class VerifyClusterPaymentResponse(BaseModel):
     reference: str = Field(..., description="Paystack transaction reference")
     email: str = Field(..., description="User email")
     product: str = Field(..., description="Product purchased")
+
+
+class UserClusterWeightsResponse(BaseModel):
+    """Response containing user's stored cluster weights"""
+    reference: str = Field(..., description="Paystack transaction reference")
+    email: str = Field(..., description="User email")
+    kcse_overall: str = Field(..., description="KCSE overall grade")
+    cluster_weights: Dict[str, float] = Field(..., description="All 20 cluster weights")
+    product: str = Field(..., description="Product type")
+    timestamp: str = Field(..., description="When the weights were calculated")
 
 
 # ==================== VERIFY CLUSTER WEIGHT PAYMENT ====================
@@ -147,12 +157,18 @@ async def verify_cluster_payment(request: VerifyClusterPaymentRequest) -> Verify
 
 # ==================== GET USER CLUSTER WEIGHTS ====================
 
-@router.get("/user-cluster-weights/{email}")
-async def get_user_cluster_weights(email: str) -> Dict:
+@router.get("/user-cluster-weights", response_model=UserClusterWeightsResponse)
+async def get_user_cluster_weights(email: str = Query(..., description="User email to retrieve weights for")) -> UserClusterWeightsResponse:
     """
     Retrieve stored cluster weights for a user
     
+    Query Parameters:
+    - email: The user's email address
+    
     Returns the latest cluster weight calculation for the user
+    
+    Example:
+    GET /api/payments/user-cluster-weights?email=user@example.com
     """
     try:
         logger.info(f"📊 Retrieving cluster weights for: {email}")
@@ -173,23 +189,33 @@ async def get_user_cluster_weights(email: str) -> Dict:
         )
 
         if not record:
-            logger.error(f"❌ No cluster weights found for: {email}")
+            logger.warning(f"⚠️ No cluster weights found for: {email}")
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="No cluster weight records found for this user"
+                detail=f"No cluster weight records found for email: {email}"
             )
 
         # Remove MongoDB's ObjectId for JSON serialization
         record.pop("_id", None)
-        record["timestamp"] = record["timestamp"].isoformat()
+        
+        # Convert timestamp to ISO format string
+        timestamp_str = record["timestamp"].isoformat() if isinstance(record["timestamp"], datetime) else str(record["timestamp"])
 
         logger.info(f"✓ Retrieved cluster weights for {email}")
-        return record
+        
+        return UserClusterWeightsResponse(
+            reference=record.get("reference", ""),
+            email=record.get("email"),
+            kcse_overall=record.get("kcse_overall"),
+            cluster_weights=record.get("cluster_weights", {}),
+            product=record.get("product", "cluster_weight_calculator"),
+            timestamp=timestamp_str
+        )
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Error retrieving cluster weights: {e}")
+        logger.error(f"❌ Error retrieving cluster weights: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to retrieve cluster weights: {str(e)}"

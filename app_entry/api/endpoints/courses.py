@@ -1,13 +1,14 @@
 # ============================================================================
-# FILE: app_entry/api/endpoints/courses.py (FIXED - with cluster_weights)
+# FILE: app_entry/api/endpoints/courses.py (WITH BASKET FUNCTIONALITY)
 # ============================================================================
-"""Course checking endpoints - with multi-step qualification"""
+"""Course checking endpoints - with multi-step qualification & basket management"""
 
-from fastapi import APIRouter, HTTPException, status, Depends
+from fastapi import APIRouter, HTTPException, status, Depends, Query
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from datetime import datetime
 import logging
-from typing import List
+from typing import List, Dict
+from pydantic import BaseModel, EmailStr, Field
 
 from app_entry.schemas.education import (
     CourseCheckRequest, CourseCheckResponse, EducationType,
@@ -21,6 +22,48 @@ from app_entry.utils.validators import validate_subjects
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# ==================== BASKET SCHEMAS ====================
+
+class CourseItem(BaseModel):
+    """Course item for basket"""
+    institution_name: str = Field(..., description="Institution name")
+    programme_name: str = Field(..., description="Programme name")
+    programme_code: str = Field(..., description="Programme code")
+    cluster_name: str = Field(..., description="Cluster name")
+    minimum_grade: str = Field(None, description="Minimum grade required")
+    cut_off_points: float = Field(None, description="Cut off points")
+
+
+class AddToBasketRequest(BaseModel):
+    """Request to add course to basket"""
+    email: EmailStr = Field(..., description="User email")
+    course: CourseItem = Field(..., description="Course details")
+
+
+class RemoveFromBasketRequest(BaseModel):
+    """Request to remove course from basket"""
+    email: EmailStr = Field(..., description="User email")
+    programme_code: str = Field(..., description="Programme code to remove")
+
+
+class BasketItemResponse(BaseModel):
+    """Basket item response"""
+    institution_name: str
+    programme_name: str
+    programme_code: str
+    cluster_name: str
+    minimum_grade: str
+    cut_off_points: float
+    added_date: str
+
+
+class UserBasketResponse(BaseModel):
+    """User's course basket"""
+    email: str
+    basket: List[BasketItemResponse]
+    total_items: int
+    last_updated: str
 
 def _safe_programme(p: dict) -> dict:
     """Safely extract programme data, handling MongoDB ObjectIds and other issues"""
@@ -280,4 +323,213 @@ async def check_courses(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to check courses"
+        )
+
+
+# ============================================================================
+# BASKET ENDPOINTS
+# ============================================================================
+
+@router.post("/add-to-basket")
+async def add_to_basket(
+    request: AddToBasketRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_by_name(settings.PAYMENTS_DB))
+) -> Dict:
+    """Add course to user's basket"""
+    try:
+        logger.info(f"🛒 Adding course to basket for: {request.email}")
+        
+        baskets_collection = db["course_baskets"]
+
+        # Create basket item
+        basket_item = {
+            "institution_name": request.course.institution_name,
+            "programme_name": request.course.programme_name,
+            "programme_code": request.course.programme_code,
+            "cluster_name": request.course.cluster_name,
+            "minimum_grade": request.course.minimum_grade,
+            "cut_off_points": request.course.cut_off_points,
+            "added_date": datetime.utcnow()
+        }
+
+        # Check if course already in basket
+        existing = await baskets_collection.find_one({
+            "email": request.email,
+            "basket.programme_code": request.course.programme_code
+        })
+
+        if existing:
+            logger.info(f"⚠️ Course already in basket for {request.email}")
+            return {
+                "status": "exists",
+                "message": "This course is already in your basket"
+            }
+
+        # Add to basket (create or update)
+        result = await baskets_collection.update_one(
+            {"email": request.email},
+            {
+                "$push": {"basket": basket_item},
+                "$set": {"last_updated": datetime.utcnow()}
+            },
+            upsert=True
+        )
+
+        logger.info(f"✓ Added course to basket for {request.email}: {request.course.programme_name}")
+
+        return {
+            "status": "success",
+            "message": f"Added {request.course.programme_name} to your basket",
+            "programme_code": request.course.programme_code
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Error adding to basket: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to add to basket: {str(e)}"
+        )
+
+
+@router.get("/user-basket")
+async def get_user_basket(
+    email: str = Query(..., description="User email"),
+    db: AsyncIOMotorDatabase = Depends(get_db_by_name(settings.PAYMENTS_DB))
+) -> UserBasketResponse:
+    """Get user's course basket"""
+    try:
+        logger.info(f"🛒 Retrieving basket for: {email}")
+
+        baskets_collection = db["course_baskets"]
+
+        # Get user's basket
+        basket_record = await baskets_collection.find_one({"email": email})
+
+        if not basket_record:
+            logger.info(f"ℹ️ No basket found for {email}, returning empty basket")
+            return UserBasketResponse(
+                email=email,
+                basket=[],
+                total_items=0,
+                last_updated=datetime.utcnow().isoformat()
+            )
+
+        # Convert basket items
+        basket_items = []
+        for item in basket_record.get("basket", []):
+            added_date = item.get("added_date")
+            if isinstance(added_date, datetime):
+                added_date_str = added_date.isoformat()
+            else:
+                added_date_str = str(added_date)
+            
+            basket_items.append(BasketItemResponse(
+                institution_name=item.get("institution_name", ""),
+                programme_name=item.get("programme_name", ""),
+                programme_code=item.get("programme_code", ""),
+                cluster_name=item.get("cluster_name", ""),
+                minimum_grade=item.get("minimum_grade", ""),
+                cut_off_points=item.get("cut_off_points", 0.0),
+                added_date=added_date_str
+            ))
+
+        last_updated = basket_record.get("last_updated")
+        if isinstance(last_updated, datetime):
+            last_updated_str = last_updated.isoformat()
+        else:
+            last_updated_str = str(last_updated)
+
+        logger.info(f"✓ Retrieved basket for {email} with {len(basket_items)} items")
+
+        return UserBasketResponse(
+            email=email,
+            basket=basket_items,
+            total_items=len(basket_items),
+            last_updated=last_updated_str
+        )
+
+    except Exception as e:
+        logger.error(f"❌ Error retrieving basket: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve basket: {str(e)}"
+        )
+
+
+@router.delete("/remove-from-basket")
+async def remove_from_basket(
+    request: RemoveFromBasketRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_by_name(settings.PAYMENTS_DB))
+) -> Dict:
+    """Remove course from user's basket"""
+    try:
+        logger.info(f"🗑️ Removing course {request.programme_code} from basket for: {request.email}")
+
+        baskets_collection = db["course_baskets"]
+
+        # Remove from basket
+        result = await baskets_collection.update_one(
+            {"email": request.email},
+            {
+                "$pull": {"basket": {"programme_code": request.programme_code}},
+                "$set": {"last_updated": datetime.utcnow()}
+            }
+        )
+
+        if result.matched_count == 0:
+            logger.warning(f"⚠️ No basket found for {request.email}")
+            return {"status": "not_found", "message": "Basket not found"}
+
+        if result.modified_count == 0:
+            logger.info(f"ℹ️ Course {request.programme_code} not in basket for {request.email}")
+            return {"status": "not_found", "message": "Course not in basket"}
+
+        logger.info(f"✓ Removed course {request.programme_code} from basket for {request.email}")
+
+        return {
+            "status": "success",
+            "message": "Course removed from basket",
+            "programme_code": request.programme_code
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Error removing from basket: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to remove from basket: {str(e)}"
+        )
+
+
+@router.delete("/clear-basket")
+async def clear_basket(
+    email: str = Query(..., description="User email"),
+    db: AsyncIOMotorDatabase = Depends(get_db_by_name(settings.PAYMENTS_DB))
+) -> Dict:
+    """Clear all courses from user's basket"""
+    try:
+        logger.info(f"🗑️ Clearing basket for: {email}")
+
+        baskets_collection = db["course_baskets"]
+
+        # Clear basket
+        await baskets_collection.update_one(
+            {"email": email},
+            {
+                "$set": {
+                    "basket": [],
+                    "last_updated": datetime.utcnow()
+                }
+            },
+            upsert=True
+        )
+
+        logger.info(f"✓ Cleared basket for {email}")
+
+        return {"status": "success", "message": "Basket cleared"}
+
+    except Exception as e:
+        logger.error(f"❌ Error clearing basket: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to clear basket: {str(e)}"
         )
